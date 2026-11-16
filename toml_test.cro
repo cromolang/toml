@@ -1,0 +1,110 @@
+// The tests of the package: cromo test toml.cro, in this folder.
+import std.json
+
+string refused(string text) {
+    try {
+        parse(text)
+    } catch (Error e) {
+        ret e.message()
+    }
+    ret "read"
+}
+
+[[test]]
+void theValues() {
+    json.Value v = parse("title = \"Shop\"\ncount = 42\nratio = 2.5\nopen = true\nbig = 1_000_000\nhex = 0xFF\nneg = -7\nexp = 1e3\n")
+    assert(v.get("title").asText() == "Shop")
+    assert(v.get("count").asInt() == 42)
+    assert(v.get("ratio").asFloat() == 2.5)
+    assert(v.get("open").asBool())
+    assert(v.get("big").asInt() == 1000000)
+    assert(v.get("hex").asInt() == 255)
+    assert(v.get("neg").asInt() == -7)
+    assert(v.get("exp").asFloat() == 1000)
+    assert(json.encode(v) == "{\"title\":\"Shop\",\"count\":42,\"ratio\":2.5,\"open\":true,\"big\":1000000,\"hex\":255,\"neg\":-7,\"exp\":1000.0}")
+}
+
+[[test]]
+void theTexts() {
+    json.Value v = parse("a = \"tab\\there, \\u00e8 and \\\"quotes\\\"\"\nb = 'C:\\path\\name'\nc = \"\"\"\nfirst\nsecond\"\"\"\nd = '''\nas \\n it is'''\ne = \"\"\"one \\\n   line\"\"\"\n")
+    assert(v.get("a").asText() == "tab\there, è and \"quotes\"")
+    assert(v.get("b").asText() == "C:\\path\\name")
+    assert(v.get("c").asText() == "first\nsecond")
+    assert(v.get("d").asText() == "as \\n it is")
+    assert(v.get("e").asText() == "one line")
+}
+
+[[test]]
+void theTables() {
+    string text = "# the settings\nname = \"app\"\n\n[server]\nhost = \"localhost\"  # here\nport = 8080\n\n[server.tls]\nenabled = true\n\n[limits]\nrate.burst = 5\nrate.window = 60\n"
+    json.Value v = parse(text)
+    assert(v.get("server").get("host").asText() == "localhost")
+    assert(v.get("server").get("port").asInt() == 8080)
+    assert(v.get("server").get("tls").get("enabled").asBool())
+    assert(v.get("limits").get("rate").get("window").asInt() == 60)
+    assert(v.keys().len() == 3)
+}
+
+[[test]]
+void theArrays() {
+    json.Value v = parse("ports = [80, 443,\n  8080,  # the last\n]\nmixed = [[1, 2], [\"a\"]]\npoint = { x = 1, y = 2, name = \"p\" }\nempty = []\n")
+    assert(v.get("ports").len() == 3 && v.get("ports").at(2).asInt() == 8080)
+    assert(v.get("mixed").at(1).at(0).asText() == "a")
+    assert(v.get("point").get("y").asInt() == 2 && v.get("point").get("name").asText() == "p")
+    assert(v.get("empty").len() == 0)
+}
+
+[[test]]
+void theArraysOfTables() {
+    string text = "[[users]]\nname = \"ada\"\nroles = [\"admin\"]\n\n[[users]]\nname = \"alan\"\n[users.address]\ncity = \"London\"\n\n[[users]]\nname = \"grace\"\n"
+    json.Value v = parse(text)
+    assert(v.get("users").len() == 3)
+    assert(v.get("users").at(0).get("roles").at(0).asText() == "admin")
+    assert(v.get("users").at(1).get("address").get("city").asText() == "London")
+    assert(v.get("users").at(2).get("name").asText() == "grace")
+    assert(!v.get("users").at(2).has("address"))
+}
+
+[[test]]
+void theDates() {
+    json.Value v = parse("when = 2026-11-16T10:30:00Z\nday = 2026-11-16\nat = 10:30:00\nboth = 2026-11-16 10:30:00\n")
+    assert(v.get("when").asText() == "2026-11-16T10:30:00Z")
+    assert(v.get("day").asText() == "2026-11-16")
+    assert(v.get("at").asText() == "10:30:00")
+    assert(v.get("both").asText() == "2026-11-16 10:30:00")
+}
+
+struct Server {
+    string host
+    i64 port = 80
+    list<string> names
+}
+
+struct Settings {
+    string title
+    bool debug
+    Server server
+    list<Server> mirrors
+}
+
+[[test]]
+void intoAStruct() {
+    string text = "title = \"Shop\"\ndebug = true\n\n[server]\nhost = \"localhost\"\nport = 8080\nnames = [\"a\", \"b\"]\n\n[[mirrors]]\nhost = \"one\"\n\n[[mirrors]]\nhost = \"two\"\nport = 81\n"
+    Settings s = decode<Settings>(text)
+    assert(s.title == "Shop" && s.debug)
+    assert(s.server.host == "localhost" && s.server.port == 8080 && s.server.names.len() == 2)
+    assert(s.mirrors.len() == 2 && s.mirrors[0].port == 80 && s.mirrors[1].port == 81)
+}
+
+[[test]]
+void whatIsRefused() {
+    assert(refused("a = 1\na = 2\n") == "toml: line 2: the key 'a' is written twice")
+    assert(refused("[t]\nx = 1\n[t]\n") == "toml: line 3: the table 't' is written twice")
+    assert(refused("name = Shop\n") == "toml: line 1: 'Shop' is not a value of TOML: a text is between quotes")
+    assert(refused("a = \"open\n") == "toml: line 1: a text is not closed at the end of its line")
+    assert(refused("a = 1 b = 2\n") == "toml: line 1: 'b' after the value: a line has one key and one value")
+    assert(refused("\n\n= 3\n") == "toml: line 3: a key is expected: letters, digits, - and _, or a text between quotes")
+    assert(refused("a = [1, 2\n") == "toml: line 2: in an array a , or a ] is expected")
+    assert(refused("a = 1\na.b = 2\n") == "toml: line 2: 'a' has a value already, which is not a table to add to")
+    assert(refused("p = { x = 1 }\np.y = 2\n") == "toml: line 2: 'p' has a value already, which is not a table to add to")
+}

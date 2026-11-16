@@ -1,0 +1,638 @@
+// TOML for Cromo: 'parse' reads a text of TOML, as a file of settings, into a
+// 'json.Value', and 'decode' into a struct of the program, as 'json.decode' does for
+// JSON. The package is written in Cromo, and needs nothing else.
+//
+// '''
+// import toml
+//
+// struct Server {
+//     string host
+//     i64 port
+// }
+//
+// struct Settings {
+//     string title
+//     Server server
+// }
+//
+// Settings s = toml.decode<Settings>("title = \"Shop\"\n[server]\nhost = \"localhost\"\nport = 8080\n")
+// println("{} on {}:{}", s.title, s.server.host, s.server.port)   // Shop on localhost:8080
+// '''
+//
+// It reads TOML 1.0: tables and arrays of tables, keys with dots, the four kinds of
+// strings, integers also in hexadecimal, octal and binary, floats, booleans, arrays and
+// inline tables. A date or a time is given as its text, as "2026-11-16T10:30:00Z". A
+// text that is not TOML throws an 'Error' with its line.
+import std.json
+
+// What is read, before it becomes a json.Value: a table, an array or a value.
+struct Node {
+    i32 kind  // 0 a table, 1 an array, 2 a text, 3 an integer, 4 a float, 5 a boolean
+    string text
+    i64 number
+    f64 fraction
+    bool flag
+    list<string> names   // of a table: its keys, in their order
+    list<Node> children  // of a table, by its keys; of an array, its elements
+    bool defined         // a table with a header of its own, [name]: it cannot have another
+    bool closed          // a value written whole, as an inline table or an array: nothing is added to it
+    bool tables          // an array of tables, [[name]]
+}
+
+struct Reader {
+    string text
+    i64 at
+    i64 line = 1
+
+    Error wrong(string what) const {
+        ret Error(format("toml: line {}: {}", line, what))
+    }
+
+    bool more() const {
+        ret at < text.len()
+    }
+
+    u8 peek() const {
+        ret at < text.len() ? text[at] : u8(0)
+    }
+
+    bool starts(string word) const {
+        if (at + word.len() > text.len()) {
+            ret false
+        }
+        for (i64 i = 0; i < word.len(); i++) {
+            if (text[at + i] != word[i]) {
+                ret false
+            }
+        }
+        ret true
+    }
+
+    // Spaces and tabs.
+    void blanks() {
+        for (more() && (text[at] == ' ' || text[at] == '\t')) {
+            at++
+        }
+    }
+
+    // Spaces, comments and ends of line.
+    void emptyLines() {
+        for (more()) {
+            u8 c = text[at]
+            if (c == ' ' || c == '\t' || c == '\r') {
+                at++
+            } else if (c == '\n') {
+                at++
+                line++
+            } else if (c == '#') {
+                for (more() && text[at] != '\n') {
+                    at++
+                }
+            } else {
+                ret
+            }
+        }
+    }
+
+    // After a value or a header: a comment at the most, then the end of the line.
+    void endOfLine() {
+        blanks()
+        if (more() && text[at] == '#') {
+            for (more() && text[at] != '\n') {
+                at++
+            }
+        }
+        if (more() && text[at] == '\r') {
+            at++
+        }
+        if (more() && text[at] != '\n') {
+            throw wrong(format("'{}' after the value: a line has one key and one value", string([text[at]])))
+        }
+    }
+
+    // A key, with its parts between dots: name, "a name", 'a name', a.b.c.
+    list<string> key() {
+        list<string> parts
+        for (true) {
+            blanks()
+            u8 c = peek()
+            if (c == '"') {
+                at++
+                parts.add(basic(false))
+            } else if (c == '\'') {
+                at++
+                parts.add(literal(false))
+            } else {
+                i64 start = at
+                for (more() && bare(text[at])) {
+                    at++
+                }
+                if (at == start) {
+                    throw wrong("a key is expected: letters, digits, - and _, or a text between quotes")
+                }
+                parts.add(text.slice(start, at))
+            }
+            blanks()
+            if (peek() != '.') {
+                ret parts
+            }
+            at++
+        }
+        ret parts
+    }
+
+    bool bare(u8 c) const {
+        ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
+    }
+
+    // A text between ", after the first one, with its escapes; `long` for the one
+    // between three, which goes over more lines.
+    string basic(bool long) {
+        list<u8> made
+        if (long && peek() == '\r') {
+            at++
+        }
+        if (long && peek() == '\n') {  // the end of line right after the quotes is not of the text
+            at++
+            line++
+        }
+        for (true) {
+            if (!more()) {
+                throw wrong("a text is not closed")
+            }
+            u8 c = text[at]
+            if (c == '"') {
+                if (!long) {
+                    at++
+                    ret string(made)
+                }
+                if (starts("\"\"\"")) {
+                    at += 3
+                    for (i64 extra = 0; extra < 2 && peek() == '"'; extra++) {  // up to two quotes more are of the text
+                        made.add('"')
+                        at++
+                    }
+                    ret string(made)
+                }
+                made.add(c)
+                at++
+            } else if (c == '\\') {
+                at++
+                escape(ref made, long)
+            } else if (c == '\n') {
+                if (!long) {
+                    throw wrong("a text is not closed at the end of its line")
+                }
+                made.add(c)
+                at++
+                line++
+            } else {
+                made.add(c)
+                at++
+            }
+        }
+        ret string(made)
+    }
+
+    void escape(ref list<u8> made, bool long) {
+        u8 c = peek()
+        at++
+        if (c == 'n') {
+            made.add('\n')
+        } else if (c == 't') {
+            made.add('\t')
+        } else if (c == 'r') {
+            made.add('\r')
+        } else if (c == '"') {
+            made.add('"')
+        } else if (c == '\\') {
+            made.add('\\')
+        } else if (c == 'b') {
+            made.add(8)
+        } else if (c == 'f') {
+            made.add(12)
+        } else if (c == 'u' || c == 'U') {
+            i64 digits = c == 'u' ? 4 : 8
+            u32 code = 0
+            for (i64 i = 0; i < digits; i++) {
+                i64 digit = hexDigit(peek())
+                if (digit < 0) {
+                    throw wrong("a character written with \\u has 4 hexadecimal digits, and with \\U 8")
+                }
+                code = code * 16 + u32(digit)
+                at++
+            }
+            if (code > 0x10FFFF || (code >= 0xD800 && code < 0xE000)) {
+                throw wrong("the character written with \\u is not one of Unicode")
+            }
+            utf8(ref made, code)
+        } else if (long && (c == '\n' || c == '\r' || c == ' ' || c == '\t')) {
+            // A \ at the end of a line of a long text: the spaces and the lines that follow are left out.
+            at--
+            i64 start = at
+            for (more() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\r' || text[at] == '\n')) {
+                if (text[at] == '\n') {
+                    line++
+                }
+                at++
+            }
+            bool newline = false
+            for (i64 i = start; i < at; i++) {
+                newline = newline || text[i] == '\n'
+            }
+            if (!newline) {
+                throw wrong("after \\ a letter is expected, as \\n, or the end of the line")
+            }
+        } else {
+            throw wrong(format("\\{} is not an escape of TOML", string([c])))
+        }
+    }
+
+    // A text between ', after the first one, as it is written.
+    string literal(bool long) {
+        if (long && peek() == '\r') {
+            at++
+        }
+        if (long && peek() == '\n') {
+            at++
+            line++
+        }
+        i64 start = at
+        for (true) {
+            if (!more()) {
+                throw wrong("a text is not closed")
+            }
+            u8 c = text[at]
+            if (c == '\'' && !long) {
+                at++
+                ret text.slice(start, at - 1)
+            }
+            if (c == '\'' && starts("'''")) {
+                i64 end = at
+                at += 3
+                for (i64 extra = 0; extra < 2 && peek() == '\''; extra++) {
+                    end++
+                    at++
+                }
+                ret text.slice(start, end)
+            }
+            if (c == '\n') {
+                if (!long) {
+                    throw wrong("a text is not closed at the end of its line")
+                }
+                line++
+            }
+            at++
+        }
+        ret ""
+    }
+
+    Node value() {
+        blanks()
+        Node made
+        made.closed = true
+        u8 c = peek()
+        if (starts("\"\"\"")) {
+            at += 3
+            made.kind = 2
+            made.text = basic(true)
+        } else if (c == '"') {
+            at++
+            made.kind = 2
+            made.text = basic(false)
+        } else if (starts("'''")) {
+            at += 3
+            made.kind = 2
+            made.text = literal(true)
+        } else if (c == '\'') {
+            at++
+            made.kind = 2
+            made.text = literal(false)
+        } else if (starts("true") || starts("false")) {
+            made.kind = 5
+            made.flag = c == 't'
+            at += made.flag ? 4 : 5
+        } else if (c == '[') {
+            at++
+            made.kind = 1
+            for (true) {
+                emptyLines()
+                if (peek() == ']') {
+                    at++
+                    break
+                }
+                made.children.add(value())
+                emptyLines()
+                if (peek() == ',') {
+                    at++
+                } else if (peek() != ']') {
+                    throw wrong("in an array a , or a ] is expected")
+                }
+            }
+        } else if (c == '{') {
+            at++
+            made.kind = 0
+            blanks()
+            if (peek() == '}') {
+                at++
+            } else {
+                for (true) {
+                    list<string> path = key()
+                    if (peek() != '=') {
+                        throw wrong("in an inline table = is expected after a key")
+                    }
+                    at++
+                    Node item = value()
+                    made.closed = false
+                    put(ref made, path, 0, move item)
+                    made.closed = true
+                    blanks()
+                    if (peek() == ',') {
+                        at++
+                    } else if (peek() == '}') {
+                        at++
+                        break
+                    } else {
+                        throw wrong("in an inline table a , or a } is expected")
+                    }
+                }
+            }
+        } else {
+            number(ref made)
+        }
+        ret made
+    }
+
+    // A number, or a date or a time, which is given as its text.
+    void number(ref Node made) {
+        i64 start = at
+        for (more() && text[at] != ',' && text[at] != ']' && text[at] != '}' && text[at] != '#' && text[at] != '\n' && text[at] != '\r') {
+            at++
+        }
+        string word = text.slice(start, at).trim()
+        at = start + word.len()  // a date can have a space in it: what follows it is looked at again
+        if (word.len() == 0) {
+            throw wrong("a value is expected after =")
+        }
+        bool date = word.len() >= 8 && ((word[4] == '-' && word[7] == '-') || (word[2] == ':' && word[5] == ':'))
+        if (date) {
+            made.kind = 2
+            made.text = word
+            ret
+        }
+        i64 space = word.find(" ")
+        if (space >= 0) {
+            word = word.slice(0, space)
+            at = start + space
+        }
+        string digits = word.replace("_", "")
+        bool negative = digits.startsWith("-")
+        string unsigned = negative || digits.startsWith("+") ? digits.slice(1, digits.len()) : digits.copy()
+        if (unsigned == "inf" || unsigned == "nan") {
+            made.kind = 4
+            made.fraction = f64(digits)
+            ret
+        }
+        i64 base = unsigned.startsWith("0x") ? 16 : unsigned.startsWith("0o") ? 8 : unsigned.startsWith("0b") ? 2 : 10
+        if (base != 10) {
+            i64 total = 0
+            if (unsigned.len() == 2 || negative || digits.startsWith("+")) {
+                throw wrong(format("'{}' is not a number", word))
+            }
+            for (i64 i = 2; i < unsigned.len(); i++) {
+                i64 digit = hexDigit(unsigned[i])
+                if (digit < 0 || digit >= base) {
+                    throw wrong(format("'{}' is not a number", word))
+                }
+                total = total * base + digit
+            }
+            made.kind = 3
+            made.number = total
+            ret
+        }
+        bool fraction = false
+        for (i64 i = 0; i < unsigned.len(); i++) {
+            u8 d = unsigned[i]
+            if (d == '.' || d == 'e' || d == 'E') {
+                fraction = true
+            } else if (!(d >= '0' && d <= '9') && d != '+' && d != '-') {
+                throw wrong(format("'{}' is not a value of TOML: a text is between quotes", word))
+            }
+        }
+        try {
+            if (fraction) {
+                made.kind = 4
+                made.fraction = f64(digits)
+            } else {
+                made.kind = 3
+                made.number = i64(digits)
+            }
+        } catch (Error e) {
+            throw wrong(format("'{}' is not a number", word))
+        }
+    }
+
+    // Puts a value in a table at a path of keys, from the key `from`: the tables on the
+    // way are made, and the last element of an array of tables is the one that is meant.
+    void put(ref Node table, list<string> path, i64 from, move Node item) {
+        if (table.kind == 1 && table.tables && table.children.len() > 0) {
+            put(ref table.children[table.children.len() - 1], path, from, move item)
+            ret
+        }
+        if (table.kind != 0 || table.closed) {
+            throw wrong(format("'{}' has a value already, which is not a table to add to", path[from > 0 ? from - 1 : 0]))
+        }
+        string name = path[from]
+        i64 found = -1
+        for (i64 i = 0; i < table.names.len(); i++) {
+            if (table.names[i] == name) {
+                found = i
+            }
+        }
+        if (from == path.len() - 1) {
+            if (found >= 0) {
+                throw wrong(format("the key '{}' is written twice", name))
+            }
+            table.names.add(name)
+            table.children.add(move item)
+            ret
+        }
+        if (found < 0) {
+            Node inner
+            table.names.add(name)
+            table.children.add(move inner)
+            found = table.names.len() - 1
+        }
+        put(ref table.children[found], path, from + 1, move item)
+    }
+
+    // The header of a table, [a.b], or of an element of an array of tables, [[a.b]]:
+    // what follows goes there.
+    void header(ref Node root, list<string> path, bool element) {
+        open(ref root, path, 0, element)
+    }
+
+    void open(ref Node table, list<string> path, i64 from, bool element) {
+        if (table.kind == 1 && table.tables && table.children.len() > 0) {
+            open(ref table.children[table.children.len() - 1], path, from, element)
+            ret
+        }
+        if (table.kind != 0 || table.closed) {
+            throw wrong(format("'{}' has a value already, which is not a table", path[from > 0 ? from - 1 : 0]))
+        }
+        string name = path[from]
+        i64 found = -1
+        for (i64 i = 0; i < table.names.len(); i++) {
+            if (table.names[i] == name) {
+                found = i
+            }
+        }
+        bool last = from == path.len() - 1
+        if (found < 0) {
+            Node inner
+            if (last && element) {
+                inner.kind = 1
+                inner.tables = true
+                Node first
+                first.defined = true
+                inner.children.add(move first)
+            } else if (last) {
+                inner.defined = true
+            }
+            table.names.add(name)
+            table.children.add(move inner)
+            ret
+        }
+        if (!last) {
+            open(ref table.children[found], path, from + 1, element)
+            ret
+        }
+        if (element) {
+            if (table.children[found].kind != 1 || !table.children[found].tables) {
+                throw wrong(format("'{}' is not an array of tables: it was written another way before", name))
+            }
+            Node next
+            next.defined = true
+            table.children[found].children.add(move next)
+        } else {
+            if (table.children[found].kind != 0 || table.children[found].defined || table.children[found].closed) {
+                throw wrong(format("the table '{}' is written twice", name))
+            }
+            table.children[found].defined = true
+        }
+    }
+}
+
+i64 hexDigit(u8 c) {
+    if (c >= '0' && c <= '9') {
+        ret i64(c - '0')
+    }
+    if (c >= 'a' && c <= 'f') {
+        ret i64(c - 'a') + 10
+    }
+    if (c >= 'A' && c <= 'F') {
+        ret i64(c - 'A') + 10
+    }
+    ret -1
+}
+
+void utf8(ref list<u8> made, u32 code) {
+    if (code < 0x80) {
+        made.add(u8(code))
+    } else if (code < 0x800) {
+        made.add(u8(0xC0 | (code >> 6)))
+        made.add(u8(0x80 | (code & 0x3F)))
+    } else if (code < 0x10000) {
+        made.add(u8(0xE0 | (code >> 12)))
+        made.add(u8(0x80 | ((code >> 6) & 0x3F)))
+        made.add(u8(0x80 | (code & 0x3F)))
+    } else {
+        made.add(u8(0xF0 | (code >> 18)))
+        made.add(u8(0x80 | ((code >> 12) & 0x3F)))
+        made.add(u8(0x80 | ((code >> 6) & 0x3F)))
+        made.add(u8(0x80 | (code & 0x3F)))
+    }
+}
+
+json.Value valueOf(Node node) {
+    if (node.kind == 0) {
+        json.Value made = json.object()
+        for (i64 i = 0; i < node.names.len(); i++) {
+            made.set(node.names[i], valueOf(node.children[i]))
+        }
+        ret made
+    }
+    if (node.kind == 1) {
+        json.Value made = json.array()
+        for (Node child in node.children) {
+            made.add(valueOf(child))
+        }
+        ret made
+    }
+    if (node.kind == 2) {
+        ret json.Value.Text(node.text)
+    }
+    if (node.kind == 3) {
+        ret json.Value.Int(node.number)
+    }
+    if (node.kind == 4) {
+        ret json.Value.Float(node.fraction)
+    }
+    ret json.Value.Bool(node.flag)
+}
+
+// Reads a text of TOML into a value: a table is an object, with its keys in their
+// order, and an array an array. Throws an 'Error' with the line of what is not TOML.
+public json.Value parse(string text) {
+    Reader r
+    r.text = text
+    Node root
+    list<string> where  // the table of the last header
+    for (true) {
+        r.emptyLines()
+        if (!r.more()) {
+            break
+        }
+        if (r.peek() == '[') {
+            r.at++
+            bool element = r.peek() == '['
+            if (element) {
+                r.at++
+            }
+            where = r.key()
+            if (r.peek() != ']') {
+                throw r.wrong("the header of a table ends with ]")
+            }
+            r.at++
+            if (element) {
+                if (r.peek() != ']') {
+                    throw r.wrong("the header of an array of tables ends with ]]")
+                }
+                r.at++
+            }
+            r.header(ref root, where, element)
+            r.endOfLine()
+            continue
+        }
+        list<string> path = where
+        for (string part in r.key()) {
+            path.add(part)
+        }
+        if (r.peek() != '=') {
+            throw r.wrong("= is expected after a key")
+        }
+        r.at++
+        Node item = r.value()
+        r.put(ref root, path, 0, move item)
+        r.endOfLine()
+    }
+    ret valueOf(root)
+}
+
+// A value of the type 'T' from a text of TOML, as 'json.decode' from one of JSON: a
+// table gives a struct or a map, an array a list, and a key that is missing leaves the
+// default value in its field. Throws an 'Error' for a text that is not TOML, and for a
+// value of another kind than its field.
+public T decode<T : json.Data>(string text) {
+    ret json.fromValue<T>(parse(text))
+}
